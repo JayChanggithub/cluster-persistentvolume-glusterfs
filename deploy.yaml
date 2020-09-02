@@ -1,0 +1,215 @@
+#!/usr/bin/env ansible-playbook
+
+- hosts: all
+  gather_facts: True
+  vars_files:
+    - ./variables/variables.yaml
+  tasks:
+    - name: Test connectivity
+      ping:
+      register: result
+
+    - name: Print result
+      debug:
+        msg: "{{ result['ping'] }}"
+
+    - name: Deploy public key to nodes
+      shell: |
+        if [ $(ls -al ~/.ssh/ | grep -ci 'id_rsa') -ne 0 ]; then
+            echo '~/.ssh/ not empty.'
+            rm -rf ~/.ssh/*
+        fi
+        yes | cp -rf ./ssh/id_rsa ~/.ssh/
+        chmod 700 ~/.ssh/id_rsa
+        sshpass -p "{{ ansible_ssh_pass }}" \
+        ssh-copy-id -i {{ ssh_pub_key }} \
+        root@{{ item }} -o StrictHostKeychecking=no
+      args:
+        executable: /bin/bash
+      delegate_to: "localhost"
+      with_items:
+        - "{{ master2_ip }}"
+        - "{{ master3_ip }}"
+        - "{{ master1_ip }}"
+      register: pub_key_result
+
+    - name: Setup hosts file
+      shell: |
+        if [ $(cat /etc/hosts | grep -c "{{ item }}") -eq 0 ]; then
+            case {{ item }} in
+                "{{ master1_ip }}")
+                    echo "{{ item }}    {{ master1_host }}" >> /etc/hosts
+                    ;;
+                "{{ master2_ip }}")
+                    echo "{{ item }}    {{ master2_host }}" >> /etc/hosts
+                    ;;
+                "{{ master3_ip }}")
+                    echo "{{ item }}    {{ master3_host }}" >> /etc/hosts
+                    ;;
+            esac
+        fi
+      args:
+        executable: /bin/bash
+      delegate_to: "localhost"
+      with_items:
+        - "{{ master2_ip }}"
+        - "{{ master3_ip }}"
+        - "{{ master1_ip }}"
+      register: pub_key_result
+
+    - name: Print public key result
+      debug:
+        msg: "{{ pub_key_result.results }}"
+
+    - name: Defined the deploy directory
+      shell: echo /tmp/deploy
+      register: deploy_dir
+
+    - name: Showing the execute path
+      debug:
+        msg: "{{ deploy_dir.stdout }}"
+
+    - name: Delete before directory
+      file:
+        path: "{{ deploy_dir.stdout }}"
+        state: absent
+
+    - name: Create deploy directory
+      file:
+        path: "{{ deploy_dir.stdout }}"
+        recurse: yes
+        state: directory
+        mode: 0755
+        group: root
+        owner: root
+
+    - name: Delete file of within reports directory
+      shell: |
+        if [ "$(ls -a './reports' | grep -v '^\.$' \
+                | grep -v '^\..$' \
+                | grep -v '.initial')" != "" ]; then
+            rm -rf ./reports/*
+        fi
+      delegate_to: "localhost"
+
+    - name: Copy script folder to remote host
+      copy: src={{ item.src }} dest={{ item.dest }}
+      with_items:
+        - { src: './README.md', dest: "{{ deploy_dir.stdout }}" }
+        - { src: './reports', dest: "{{ deploy_dir.stdout }}" }
+        - { src: './glusterfs_install.sh', dest: "{{ deploy_dir.stdout }}" }
+
+    - name: Create glusterfs work directory folders
+      file:
+        path: "{{ work_dir }}"
+        recurse: yes
+        state: directory
+        mode: 0755
+        group: root
+        owner: root
+
+    - name: Execute remote host shell script
+      shell:
+        cmd: ls -al && bash glusterfs_install.sh
+        chdir: "{{ deploy_dir.stdout }}"
+      args:
+        executable: /bin/bash
+      register: shell_result
+
+    - name: Showing the shell script process
+      debug:
+        msg: "{{ shell_result.stdout }}"
+
+
+- hosts: "{{ master1_ip }}"
+  gather_facts: True
+  vars_files:
+    - ./variables/variables.yaml
+  tasks:
+    - name: Print variable
+      debug:
+        msg: "{{ ansible_fqdn }}"
+
+    - name: Create glusterfs cluster from "{{ master1_host }}"
+      shell: |
+        gluster peer probe {{ item }}
+      args:
+        executable: /bin/bash
+      with_items:
+        - "{{ master1_host }}"
+        - "{{ master2_host }}"
+        - "{{ master3_host }}"
+      register: shell_result
+
+    - name: Showing the shell script process
+      debug:
+        msg: "{{ shell_result }}"
+
+    - name: Create glusterfs volumes
+      shell: |
+        gluster volume create {{ item }} replica 3 \
+        {{ master1_host }}:{{ work_dir }}{{ item }} {{ master2_host }}:{{ work_dir }}{{ item }} {{ master3_host }}:{{ work_dir }}{{ item }} force
+        gluster volume set {{ item }} auth.allow 10.99.104.*,192.168.44.*
+        gluster volume start {{ item }}
+        gluster volume quota {{ item }} enable
+        gluster volume quota {{ item }} limit-usage / {{ volume_limit }}
+        gluster volume set {{ item }} performance.cache-size 1GB
+        gluster volume set {{ item }} performance.flush-behind on
+        gluster volume set {{ item }} performance.io-thread-count 32
+        gluster volume set {{ item }} performance.write-behind on
+        gluster volume info
+      args:
+        executable: /bin/bash
+      with_items: "{{ share_volumes }}"
+      register: shell_result
+    
+    - debug:
+        msg: "{{ shell_result['results'][0]['stdout'] }}"
+      when: ansible_os_family == "RedHat" and ansible_distribution_major_version == "7"
+
+    - name: Deploy endpoint of glusterfs for specified namespaces
+      shell: 
+        cmd: |
+          cat << EOF > "{{ item }}"_en.yaml
+          apiVersion: v1
+          kind: Endpoints
+          metadata:
+            name: gluster-cluster
+            namespace: "{{ item }}"
+          subsets:
+          - addresses:
+            - ip: "{{ master1_ip }}"
+            ports:
+            - port: 1991
+              protocol: TCP
+          - addresses:
+            - ip: "{{ master2_ip }}"
+            ports:
+            - port: 1991
+              protocol: TCP
+          - addresses:
+            - ip: "{{ master3_ip }}"
+            ports:
+            - port: 1991
+              protocol: TCP
+          ---
+
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: gluster-cluster
+            namespace: {{ item }}
+          spec:
+            ports:
+            - port: 1991
+          EOF
+          kubectl replace --force -f {{ item }}_en.yaml
+      args:
+        executable: /bin/bash
+        chdir: "{{ deploy_dir.stdout }}"
+      with_items: "{{ kube_namespace }}"
+      register: shell_result
+   
+    - debug:
+        msg: "{{ shell_result['results'][0]['stdout'] }}"
+      when: ansible_os_family == "RedHat" and ansible_distribution_major_version == "7"
