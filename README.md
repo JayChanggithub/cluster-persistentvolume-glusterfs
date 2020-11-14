@@ -9,7 +9,7 @@ Cluster-PersistentVolume-Glusterfs
 ---
 
 ## Version
-`Rev: 1.0.0`
+`Rev: 1.0.1`
 
 
 ---

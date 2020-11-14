@@ -9,7 +9,7 @@ master2_ip: '192.168.44.2'
 master3_ip: '192.168.44.3'
 
 share_volumes:
-  - 'etcd_backup'
+  - 'test_volume'
 
 volume_limit: '300GB'
 
@@ -20,3 +20,4 @@ kube_namespace:
     - 'kube-ops'
     - 'kube-monitor'
     - 'kube-system'
+    - 'thanos'
